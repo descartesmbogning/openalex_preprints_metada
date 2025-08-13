@@ -538,6 +538,8 @@ def build_zip_from_selection(
     compact_status: Optional[st.delta_generator.DeltaGenerator] = None,
     compact_log: Optional[st.delta_generator.DeltaGenerator] = None,
     compact_log_keep: int = 5,
+    # NEW: toggle whether to render heavy progress details
+    show_progress_details: bool = False,
 ) -> bytes:
     """Core builder: fetch sources, assemble CSVs, and produce ZIP bytes."""
     # Combine and dedupe all selected source_ids
@@ -563,35 +565,42 @@ def build_zip_from_selection(
     years_seen: Set[str] = set()
     months_seen: Set[str] = set()
 
-    # Top metrics row
-    st.subheader("3) Build progress")
-    grid_cols = st.columns(3)
-    metrics["count"] = grid_cols[0].metric("Servers processed", f"0/{total}")
-    metrics["avg"] = grid_cols[1].metric("Average time", "–")
-    metrics["eta"] = grid_cols[2].metric("ETA (approx)", "–")
+    # Optional heavy UI (metrics row + per-server panels)
+    if show_progress_details:
+        st.subheader("3) Build progress")
+        grid_cols = st.columns(3)
+        metrics["count"] = grid_cols[0].metric("Servers processed", f"0/{total}")
+        metrics["avg"]  = grid_cols[1].metric("Average time", "–")
+        metrics["eta"]  = grid_cols[2].metric("ETA (approx)", "–")
 
-    # Per-server panels: one expander per selected source
-    panels = {}
-    for sid in chosen_sids:
-        panels[sid] = {
-            "exp": st.expander(f"Server: {sid}", expanded=False),
-            "progress": None,
-            "log": None,
-            "hist": [],
-            "title": sid
-        }
+        panels = {}
+        for sid in chosen_sids:
+            panels[sid] = {
+                "exp": st.expander(f"Server: {sid}", expanded=False),
+                "progress": None,
+                "log": None,
+                "hist": [],
+                "title": sid
+            }
+        overall_prog = st.progress(0)
+    else:
+        grid_cols = [st.empty(), st.empty(), st.empty()]
+        panels = {}
+        overall_prog = st.empty()
 
-    overall_prog = st.progress(0)
-
-    # Global log helper
+    # Global log helper (always feeds the compact view; full log only if shown)
     def log_overall(msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         st.session_state.log_lines.append(f"[{ts}] {msg}")
         st.session_state.log_lines = st.session_state.log_lines[-400:]
-        overall_log.code("\n".join(st.session_state.log_lines), language=None)
+        # Only render into the big log box if visible
+        if show_progress_details:
+            overall_log.code("\n".join(st.session_state.log_lines), language=None)
 
-    # Per-server log helper
+    # Per-server log helper (no-op when panels are hidden)
     def log_server(sid: str, msg: str):
+        if not show_progress_details:
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         block = panels[sid]
         if block["log"] is None:
@@ -604,6 +613,8 @@ def build_zip_from_selection(
 
     # Metrics helper
     def update_metrics():
+        if not show_progress_details:
+            return
         elapsed = time.time() - start_t
         avg = (sum(per_server_times) / len(per_server_times)) if per_server_times else 0.0
         remaining = max(0.0, (total - done) * avg)
@@ -621,7 +632,6 @@ def build_zip_from_selection(
         if compact_log is None:
             return
         compact_lines.append(line)
-        # keep only last N lines
         if len(compact_lines) > compact_log_keep:
             compact_lines[:] = compact_lines[-compact_log_keep:]
         compact_log.text("\n".join(compact_lines))
@@ -642,13 +652,14 @@ def build_zip_from_selection(
         log_server(sid, "Fetching source JSON…")
         src = fetch_source(sid, sleep_s=sleep_s, mailto=mailto)
         display_name = src.get("display_name", "")
-        panels[sid]["title"] = display_name or sid
 
-        # Update expander header with display name for clarity
-        panels[sid]["exp"].markdown(
-            f"**Server:** {display_name or '(unknown)'}  \n"
-            f"**OpenAlex ID:** `{sid}`"
-        )
+        if show_progress_details:
+            # Update expander header with display name for clarity
+            panels[sid]["title"] = display_name or sid
+            panels[sid]["exp"].markdown(
+                f"**Server:** {display_name or '(unknown)'}  \n"
+                f"**OpenAlex ID:** `{sid}`"
+            )
 
         # Prepare for CSV: remove heavy lists, convert topics to 3 columns, flatten
         src_clean = dict(src)
@@ -696,14 +707,15 @@ def build_zip_from_selection(
                 monthly_data[flat["source_id"]][ym]["works_count"] += 1
                 monthly_data[flat["source_id"]][ym]["cited_by_count"] += int(w.get("cited_by_count", 0) or 0)
                 works_processed += 1
-                if works_processed % 500 == 0:
+                if works_processed % 500 == 0 and show_progress_details:
                     log_server(sid, f"…processed {works_processed} works so far")
-                    if panels[sid]["progress"] is not None:
+                    if panels.get(sid, {}).get("progress") is not None:
                         pct = min(99, (works_processed // 5) % 100) / 100.0
                         panels[sid]["progress"].progress(pct)
-            log_server(sid, f"Monthly aggregation complete. Total works scanned: {works_processed}")
-            if panels[sid]["progress"] is not None:
-                panels[sid]["progress"].progress(1.0)
+            if show_progress_details:
+                log_server(sid, f"Monthly aggregation complete. Total works scanned: {works_processed}")
+                if panels.get(sid, {}).get("progress") is not None:
+                    panels[sid]["progress"].progress(1.0)
         else:
             log_server(sid, "Monthly aggregation skipped (disabled).")
 
@@ -720,7 +732,8 @@ def build_zip_from_selection(
             compact_progress.progress(done / total)
 
         # Existing overall progress + metrics
-        overall_prog.progress(done / total)
+        if show_progress_details:
+            overall_prog.progress(done / total)
         log_overall(f"Finished {display_name or sid} in {int(elapsed)}s")
         update_metrics()
 
@@ -803,7 +816,14 @@ st.write(
     "When done, you can preview the CSVs and download the ZIP."
 )
 
-# (Optional) keep three metrics
+# NEW: toggle to show/hide heavy progress UI (metrics, per-server panels, full logs)
+show_progress_details = st.checkbox(
+    "Show progress details (metrics, per-server panels, full logs)",
+    value=False,
+    help="Turn ON to see detailed build metrics and logs. OFF keeps the UI compact."
+)
+
+# (Optional) keep three metrics (placeholders passed into builder)
 m1, m2, m3 = st.columns(3)
 
 # Compact status row
@@ -814,9 +834,13 @@ with c2:
     compact_log = st.empty()      # rolling last-N lines
 compact_progress = st.progress(0)
 
-# Big global log (can hide if you want only compact)
-overall_log_box = st.empty()
-overall_log_box.code("Logs will appear here…", language=None)
+# Big global log: only render if details are shown
+if show_progress_details:
+    with st.expander("📜 Show build logs", expanded=False):
+        overall_log_box = st.empty()
+        overall_log_box.code("Logs will appear here…", language=None)
+else:
+    overall_log_box = st.empty()  # invisible placeholder
 
 left, right = st.columns([1,1])
 with left:
@@ -844,6 +868,7 @@ if run_btn:
             compact_status=compact_status,
             compact_log=compact_log,
             compact_log_keep=5,  # show the last 5 lines in the compact log
+            show_progress_details=show_progress_details,  # NEW
         )
         st.success("✅ Build complete! Preview below and download your ZIP.")
 
@@ -883,4 +908,3 @@ st.markdown(
 - Keep **Monthly OFF** for quick checks; use it for final analyses with a narrow date window.
 """
 )
-

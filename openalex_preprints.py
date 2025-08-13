@@ -862,10 +862,12 @@ if run_btn:
         )
         st.dataframe(monthly_df.iloc[:, :40], use_container_width=True, height=240)
 
+        # Create timestamp string like 2025-08-13_14-30
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         st.download_button(
             "⬇️ Download results ZIP",
             data=zip_bytes,
-            file_name="openalex_preprint_servers_results.zip",
+            file_name=f"openalex_preprint_servers_results_{timestamp}.zip",
             mime="application/zip",
             help="ZIP includes three CSVs and a json/ folder with raw records."
         )
@@ -881,3 +883,4 @@ st.markdown(
 - Keep **Monthly OFF** for quick checks; use it for final analyses with a narrow date window.
 """
 )
+

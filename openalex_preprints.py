@@ -11,7 +11,8 @@ What this app does
    - servers.csv (flattened metadata, with 3 topic columns)
    - server_yearly_trends.csv (years as columns; rows are metrics)
    - server_monthly_trends.csv (optional and slower; placeholder if disabled)
-   - json/ folder with raw source JSON (inside a ZIP you can download)
+   - json/ folder with raw source JSON + 1 sample Work JSON per previewed server
+     (filenames include display name + sid for easy recognition)
 
 Key options
 -----------
@@ -29,10 +30,11 @@ Notes
 
 import io
 import json
+import re
 import time
 import zipfile
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Tuple
 from urllib.parse import quote
 
 import pandas as pd
@@ -109,6 +111,43 @@ def api_get(url: str, sleep_s: float, max_retries: int = 5, mailto: Optional[str
 def norm_name(s: str) -> str:
     """Normalize whitespace for consistent matching."""
     return " ".join((s or "").strip().split())
+
+def safe_slug(s: str) -> str:
+    """
+    Create a safe, compact filename slug from display names.
+    Keeps letters, numbers, dash and underscore; converts spaces to underscores.
+    """
+    if not s:
+        return "unknown"
+    s = s.strip().lower()
+    s = s.replace("&", "and")
+    s = s.replace("/", "-").replace("\\", "-")
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^a-z0-9\-_]", "", s)
+    return s[:80] if len(s) > 80 else s
+
+# Robust CSV reader with encoding fallbacks
+def read_csv_safely(uploaded_file) -> Tuple[pd.DataFrame, str]:
+    """
+    Try several encodings in order. Return (DataFrame, encoding_used).
+    Raises ValueError if all attempts fail.
+    """
+    # Read the raw bytes once
+    raw = uploaded_file.getvalue()
+    attempts = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    last_err = None
+    for enc in attempts:
+        try:
+            buf = io.BytesIO(raw)
+            df = pd.read_csv(buf, encoding=enc)
+            return df, enc
+        except Exception as e:
+            last_err = e
+    raise ValueError(
+        f"Failed to read CSV with encodings {attempts}. "
+        f"Last error: {last_err}"
+    )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OpenAlex: resolving & fetching
@@ -250,6 +289,52 @@ def iso_to_year_month(iso_date: str) -> Optional[str]:
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
+# NEW: sample Work fetcher + JSON pretty printer
+# ──────────────────────────────────────────────────────────────────────────────
+def fetch_sample_preprint_for_source(
+    sid: str,
+    sleep_s: float,
+    mailto: Optional[str],
+    use_primary_location: bool = True,
+    use_host_venue: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns 1 recent Work JSON for this source (or None if none found).
+    We prefer the modern 'primary_location.source.id' filter; optionally also try 'host_venue.id'.
+    """
+    filters = []
+    if use_primary_location:
+        filters.append(f"primary_location.source.id:{sid}")
+    if use_host_venue:
+        filters.append(f"host_venue.id:{sid}")
+
+    if not filters:
+        filters.append(f"primary_location.source.id:{sid}")
+
+    filter_str = ",".join(filters)
+    # select_fields = ",".join([
+    #     "id","doi","title","type","publication_date","authorships",
+    #     "primary_location","locations","open_access","cited_by_count","biblio"
+    # ])
+
+    url = (
+        f"{OPENALEX_BASE}/works?per-page=1&sort=publication_date:desc"
+        f"&filter={quote(filter_str)}"#&select={quote(select_fields)}"
+    )
+    try:
+        r = api_get(url, sleep_s=sleep_s, mailto=mailto)
+        items = r.json().get("results", [])
+        return items[0] if items else None
+    except Exception:
+        return None
+
+def to_pretty_json_str(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return json.dumps({"error": "unserializable"}, ensure_ascii=False, indent=2)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HEADER: Overview + Quick Start
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("🗂️OpenAlex Preprint Servers Metadata Collector")
@@ -353,15 +438,32 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 1: Parse names
 # ──────────────────────────────────────────────────────────────────────────────
+# names: List[str] = []
+# if uploaded_csv is not None:
+#     try:
+#         df = pd.read_csv(uploaded_csv)
+#         if df.empty:
+#             st.warning("Uploaded CSV appears to be empty.")
+#         else:
+#             first_col = df.columns[0]
+#             names = [norm_name(x) for x in df[first_col].astype(str).tolist() if norm_name(x)]
+#     except Exception as e:
+#         st.error(f"Failed to read CSV: {e}")
+
+# if manual_input.strip():
+#     names.extend([norm_name(x) for x in manual_input.splitlines() if norm_name(x)])
+
+
 names: List[str] = []
 if uploaded_csv is not None:
     try:
-        df = pd.read_csv(uploaded_csv)
+        df, enc_used = read_csv_safely(uploaded_csv)
         if df.empty:
             st.warning("Uploaded CSV appears to be empty.")
         else:
             first_col = df.columns[0]
             names = [norm_name(x) for x in df[first_col].astype(str).tolist() if norm_name(x)]
+            st.caption(f"✅ CSV loaded using **{enc_used}** encoding.")
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
 
@@ -392,6 +494,10 @@ if "selections_map" not in st.session_state:
     st.session_state.selections_map = {}     # name -> [selected short_ids]
 if "log_lines" not in st.session_state:
     st.session_state.log_lines = []
+# NEW: cache for previews
+if "preview_samples" not in st.session_state:
+    # Map sid -> {"source": <source_json>, "sample_work": <work_json or None>}
+    st.session_state.preview_samples = {}
 
 def log_app(msg: str, box: st.delta_generator.DeltaGenerator):
     """Append a timestamped line to the global log box."""
@@ -410,6 +516,7 @@ if st.button("🔍 Resolve server names to OpenAlex Sources", key="btn_resolve",
     st.session_state.candidates_map = {}
     st.session_state.selections_map = {}
     st.session_state.log_lines = []
+    st.session_state.preview_samples = {}  # clear cache when we re-resolve
     prog = st.progress(0)
     log_box = st.empty()
     for idx, name in enumerate(unique_names, start=1):
@@ -520,6 +627,80 @@ if st.session_state.candidates_map:
             st.session_state.selections_map[name] = [value_map[l] for l in selected_labels if l in value_map]
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 2b) Quick raw JSON previews (optional)
+# ──────────────────────────────────────────────────────────────────────────────
+# Build a list of currently selected SIDs
+selected_sids_all = []
+for nm, sids in st.session_state.selections_map.items():
+    selected_sids_all.extend(sids)
+# de-dup while preserving order
+tmp_seen = set()
+selected_sids_all = [s for s in selected_sids_all if s and not (s in tmp_seen or tmp_seen.add(s))]
+
+st.markdown("### 2b) Quick raw JSON previews (optional)")
+st.write("Pick a server to preview its raw JSON. These panels stay hidden until opened.")
+
+if not selected_sids_all:
+    st.info("Select at least one Source above to enable previews.")
+else:
+    col_prev_1, col_prev_2 = st.columns([2, 1])
+    with col_prev_1:
+        sid_choice = st.selectbox("Select a server (OpenAlex ID)", options=selected_sids_all, key="preview_sid")
+    with col_prev_2:
+        include_previews_in_zip = st.checkbox(
+            "Include sample preprint JSON in ZIP",
+            value=True,
+            help="If ON, we will add json/sample_work_<display>_<sid>.json for any previewed servers."
+        )
+
+    if sid_choice:
+        # ensure cached
+        if sid_choice not in st.session_state.preview_samples:
+            # fetch and store
+            src_json = fetch_source(sid_choice, sleep_s=sleep_s, mailto=mailto or None)
+            work_json = fetch_sample_preprint_for_source(
+                sid_choice, sleep_s=sleep_s, mailto=mailto or None,
+                use_primary_location=use_primary_location, use_host_venue=use_host_venue
+            )
+            st.session_state.preview_samples[sid_choice] = {
+                "source": src_json,
+                "sample_work": work_json
+            }
+
+        preview = st.session_state.preview_samples.get(sid_choice, {})
+        src_json = preview.get("source")
+        work_json = preview.get("sample_work")
+
+        disp_name = (src_json or {}).get("display_name", "")
+        title_text = f"{disp_name} — {sid_choice}" if disp_name else sid_choice
+        display_slug = safe_slug(disp_name) if disp_name else "unknown"
+
+        with st.expander(f"📘 Source JSON — {title_text}", expanded=False):
+            if src_json:
+                st.json(src_json, expanded=False)
+                st.download_button(
+                    "Download source JSON",
+                    data=to_pretty_json_str(src_json),
+                    file_name=f"source_{display_slug}_{sid_choice}.json",
+                    mime="application/json",
+                )
+            else:
+                st.warning("No source JSON found.")
+
+        with st.expander(f"📄 Sample preprint JSON — {title_text}", expanded=False):
+            if work_json:
+                st.json(work_json, expanded=False)
+                st.caption("This is just 1 recent Work for the selected source.")
+                st.download_button(
+                    "Download sample Work JSON",
+                    data=to_pretty_json_str(work_json),
+                    file_name=f"sample_work_{display_slug}_{sid_choice}.json",
+                    mime="application/json",
+                )
+            else:
+                st.info("No sample Work found for this source (try toggling host_venue, or different servers).")
+
+# ──────────────────────────────────────────────────────────────────────────────
 # STEP 3: Build — per-server panels + logs + metrics + compact UI
 # ──────────────────────────────────────────────────────────────────────────────
 def build_zip_from_selection(
@@ -540,7 +721,10 @@ def build_zip_from_selection(
     compact_log_keep: int = 5,
     # NEW: toggle whether to render heavy progress details
     show_progress_details: bool = False,
-) -> bytes:
+    # NEW: previews to optionally write into ZIP
+    preview_samples: Optional[Dict[str, Dict[str, Any]]] = None,
+    include_preview_works_in_zip: bool = True,
+):
     """Core builder: fetch sources, assemble CSVs, and produce ZIP bytes."""
     # Combine and dedupe all selected source_ids
     chosen_sids: List[str] = []
@@ -652,6 +836,7 @@ def build_zip_from_selection(
         log_server(sid, "Fetching source JSON…")
         src = fetch_source(sid, sleep_s=sleep_s, mailto=mailto)
         display_name = src.get("display_name", "")
+        display_slug = safe_slug(display_name)
 
         if show_progress_details:
             # Update expander header with display name for clarity
@@ -789,13 +974,30 @@ def build_zip_from_selection(
     # ── Package everything into a single ZIP (in memory) ──────────────────────
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # CSVs
         zf.writestr("servers.csv", servers_df.to_csv(index=False))
         zf.writestr("server_yearly_trends.csv", yearly_df.to_csv(index=False))
         zf.writestr("server_monthly_trends.csv", monthly_df.to_csv(index=False))
+
+        # Raw JSON for sources (use display name + sid in filename)
         for row in servers_rows:
             sid = row.get("source_id", "unknown")
             raw = row.get("raw_json", "{}")
-            zf.writestr(f"json/source_{sid}.json", raw)
+            disp = row.get("display_name", "")
+            slug = safe_slug(disp) if disp else "unknown"
+            zf.writestr(f"json/source_{slug}_{sid}.json", raw)
+
+        # Also include any previously previewed sample Work JSONs (optional, named with display+sid)
+        if include_preview_works_in_zip and preview_samples:
+            for sid, blobs in preview_samples.items():
+                sw = blobs.get("sample_work")
+                src = blobs.get("source", {})
+                disp = (src or {}).get("display_name", "")
+                slug = safe_slug(disp) if disp else "unknown"
+                if sw:
+                    zf.writestr(f"json/sample_work_{slug}_{sid}.json", to_pretty_json_str(sw))
+
+        # Selection summary
         zf.writestr("json/selection_summary.json", json.dumps({
             "selected_source_ids": chosen_sids,
             "date_from": date_from,
@@ -869,6 +1071,9 @@ if run_btn:
             compact_log=compact_log,
             compact_log_keep=5,  # show the last 5 lines in the compact log
             show_progress_details=show_progress_details,  # NEW
+            # NEW: include preview JSONs with display+sid filename
+            preview_samples=st.session_state.preview_samples,
+            include_preview_works_in_zip=include_previews_in_zip if 'include_previews_in_zip' in locals() else True,
         )
         st.success("✅ Build complete! Preview below and download your ZIP.")
 
